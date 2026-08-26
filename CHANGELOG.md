@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.1] - 2026-08-26
+
+### 🐛 Bug Fixes
+
+- **storage**: Handle MatrixOne aggregate and nullable parameter compatibility (#239) ([54566bc](https://github.com/matrixorigin/Memoria/commit/54566bcf33546e7fbf9a6084e16eaafefa35fdfb))
+
+### 👷 CI
+
+- Increase MatrixOne memory limit (#234) ([0e15b55](https://github.com/matrixorigin/Memoria/commit/0e15b55e20552824b93b091b379039fc9e53444f))
 ## [0.5.0] - 2026-08-26
 
 ### ⚡ Performance
