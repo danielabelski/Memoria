@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.0] - 2026-08-26
+
+### ⚡ Performance
+
+- **snapshot**: Optimize snapshot listing (#202) ([3207091](https://github.com/matrixorigin/Memoria/commit/320709171b85444c5c9115cea6f09fdba98f65b1))
+
+### 🐛 Bug Fixes
+
+- **snapshot**: Read SHOW SNAPSHOTS columns case-insensitively for MatrixOne v4.x (#226) ([4676239](https://github.com/matrixorigin/Memoria/commit/4676239597039f4ad6564e18990dde4f3f34cebe))
+- Warnings in make test command (#221) ([63f0289](https://github.com/matrixorigin/Memoria/commit/63f0289da1fb3744523b29860f7e83be88871f28))
+- Release python sdk ci (#207) ([37ca1e7](https://github.com/matrixorigin/Memoria/commit/37ca1e773af608c08b00a14f3814752c43df6c41))
+
+### 🚀 Features
+
+- Restore filtered fulltext memory search (#232) ([efd3d65](https://github.com/matrixorigin/Memoria/commit/efd3d6515969971dfa894737272b8317bcb643e7))
+- Add structured memory queries (#228) ([ca9394d](https://github.com/matrixorigin/Memoria/commit/ca9394d6015f4394e9ccccf43588ea5e0c7b4395))
+- Support extra metadata in batch write (#223) ([54c9114](https://github.com/matrixorigin/Memoria/commit/54c9114fd6888e11821edc2ee9acd570c17c5ee3))
+- Add subject_id isolation and memory_types filtering for retrieve/search (#215) ([2446feb](https://github.com/matrixorigin/Memoria/commit/2446febc9f458cdc82bcec7b984c1e5f17f26ea5))
+- Add memoria python sdk (#206) ([a2e659c](https://github.com/matrixorigin/Memoria/commit/a2e659cae58d2a42a9ee9e05f69d84c48a4f3f94))
+- Add explicit branch access for memory operations (#203) ([7b2b372](https://github.com/matrixorigin/Memoria/commit/7b2b3729568546530c11000c45894dcf2f49d87b))
+- **memory**: Add selective branch pick support (#193) ([4d16236](https://github.com/matrixorigin/Memoria/commit/4d16236cdc14f2ba5aff11266330b1caf8a29369))
 ## [0.4.0] - 2026-05-11
 
 ### 🐛 Bug Fixes
