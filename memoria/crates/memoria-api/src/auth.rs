@@ -21,6 +21,88 @@ use tracing::warn;
 
 use crate::state::{AppState, CachedApiKeyPrincipal};
 
+pub const SCOPE_IDENTITY_READ: &str = "identity:read";
+pub const SCOPE_MEMORY_READ: &str = "memory:read";
+pub const SCOPE_MEMORY_WRITE: &str = "memory:write";
+pub const SCOPE_KEYS_MANAGE: &str = "keys:manage";
+pub const DEFAULT_API_KEY_SCOPES: &str = "identity:read,memory:read,memory:write,keys:manage";
+
+pub fn parse_scopes(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|scope| !scope.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Agent labels are recorded only after the request's scope admission. MCP
+/// defers this until its tool-specific admission, not merely bearer validation.
+pub(crate) fn request_tool_name(headers: &axum::http::HeaderMap) -> Option<String> {
+    headers
+        .get("X-Memoria-Tool")
+        .or_else(|| headers.get("X-Tool-Name"))
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.is_empty())
+        .map(String::from)
+}
+
+fn required_scope_for_request(method: &axum::http::Method, path: &str) -> Option<&'static str> {
+    let under = |prefix: &str| path == prefix || path.starts_with(&format!("{prefix}/"));
+    if (path == "/auth/whoami" && method == axum::http::Method::GET)
+        || (path == "/mcp" && method == axum::http::Method::POST)
+    {
+        // MCP additionally authorizes each tool in its handler.
+        return Some(SCOPE_IDENTITY_READ);
+    }
+    if under("/auth/keys") || under("/v1/groups") {
+        // Group administration can copy personal memories, grant access to
+        // other accounts and delete databases. Memory scopes never grant it.
+        return Some(SCOPE_KEYS_MANAGE);
+    }
+    let memory_path = [
+        "/v1/memories",
+        "/v1/profiles",
+        "/v1/feedback",
+        "/v1/retrieval-params",
+        "/v1/governance",
+        "/v1/consolidate",
+        "/v1/reflect",
+        "/v1/extract-entities",
+        "/v1/entities",
+        "/v1/snapshots",
+        "/v1/branches",
+        "/v1/tasks",
+        "/v1/observe",
+        "/v1/sessions",
+        "/v1/pipeline",
+        "/v1/tool-usage",
+        "/v1/health",
+    ]
+    .iter()
+    .any(|prefix| path == *prefix || path.starts_with(&format!("{prefix}/")));
+
+    if !memory_path {
+        return None;
+    }
+    if method == axum::http::Method::GET
+        || method == axum::http::Method::HEAD
+        || (method == axum::http::Method::POST
+            && matches!(
+                path,
+                "/v1/memories/query"
+                    | "/v1/memories/fulltext-search"
+                    | "/v1/memories/retrieve"
+                    | "/v1/memories/search"
+            ))
+    {
+        Some(SCOPE_MEMORY_READ)
+    } else {
+        Some(SCOPE_MEMORY_WRITE)
+    }
+}
+
+#[derive(Clone)]
 pub struct AuthUser {
     pub user_id: String,
     /// Routing scope: equals `user_id` in personal mode, `group_id` (e.g. `grp_xxx`)
@@ -29,6 +111,9 @@ pub struct AuthUser {
     pub scope_id: String,
     pub group_id: Option<String>,
     pub is_master: bool,
+    pub key_id: Option<String>,
+    pub key_prefix: Option<String>,
+    pub scopes: Vec<String>,
 }
 
 impl AuthUser {
@@ -47,6 +132,21 @@ impl AuthUser {
     pub fn is_group_scoped(&self) -> bool {
         self.group_id.is_some()
     }
+
+    pub fn has_scope(&self, scope: &str) -> bool {
+        self.is_master || self.scopes.iter().any(|granted| granted == scope)
+    }
+
+    pub fn require_scope(&self, scope: &str) -> Result<(), (StatusCode, String)> {
+        if self.has_scope(scope) {
+            Ok(())
+        } else {
+            Err((
+                StatusCode::FORBIDDEN,
+                format!("API key missing required scope: {scope}"),
+            ))
+        }
+    }
 }
 
 async fn cached_or_db_principal(token: &str, state: &AppState) -> Option<CachedApiKeyPrincipal> {
@@ -61,7 +161,7 @@ async fn cached_or_db_principal(token: &str, state: &AppState) -> Option<CachedA
         .or_else(|| state.service.sql_store.as_ref().map(|s| s.pool()))?;
 
     let row = sqlx::query(
-        "SELECT user_id, group_id FROM mem_api_keys \
+        "SELECT key_id, user_id, group_id, key_prefix, scopes, expires_at FROM mem_api_keys \
          WHERE key_hash = ? AND is_active = 1 \
          AND (expires_at IS NULL OR expires_at > NOW(6))",
     )
@@ -72,14 +172,14 @@ async fn cached_or_db_principal(token: &str, state: &AppState) -> Option<CachedA
     .ok()??;
 
     let principal = CachedApiKeyPrincipal {
+        key_id: row.try_get("key_id").ok()?,
         user_id: row.try_get("user_id").ok()?,
         group_id: row.try_get("group_id").ok().flatten(),
+        key_prefix: row.try_get("key_prefix").ok()?,
+        scopes: parse_scopes(&row.try_get::<String, _>("scopes").ok()?),
+        expires_at: row.try_get("expires_at").ok()?,
     };
-    state.api_key_cache.insert(
-        key_hash,
-        principal.user_id.clone(),
-        principal.group_id.clone(),
-    );
+    state.api_key_cache.insert(key_hash, principal.clone());
     Some(principal)
 }
 
@@ -164,6 +264,11 @@ pub async fn group_main_write_guard(
             .await
             .filter(|p| p.group_id.is_some())
         {
+            if let Err(rejection) =
+                authorize_api_key_route(req.method(), req.uri().path(), &p.scopes)
+            {
+                return rejection.into_response();
+            }
             let gid = p.group_id.as_ref().unwrap();
             // Set task-local so active_branch_name resolves per-member state
             let user_id = p.user_id.clone();
@@ -964,13 +1069,11 @@ impl FromRequestParts<AppState> for AuthUser {
         // Agents send X-Memoria-Tool with their name: cursor / kiro / claude / codex / openclaw.
         // Fall back to X-Tool-Name for backwards compatibility with older clients.
         // Any non-empty value is accepted — no whitelist, so new agents work automatically.
-        let tool_name = parts
-            .headers
-            .get("X-Memoria-Tool")
-            .or_else(|| parts.headers.get("X-Tool-Name"))
-            .and_then(|v| v.to_str().ok())
-            .filter(|v| !v.is_empty())
-            .map(String::from);
+        let tool_name = if parts.uri.path() == "/mcp" {
+            None
+        } else {
+            request_tool_name(&parts.headers)
+        };
 
         let bearer = parts
             .headers
@@ -988,16 +1091,26 @@ impl FromRequestParts<AppState> for AuthUser {
                 // fall through
             }
             // 2) API key — user_id resolved from DB, never master
-            else if let Some((uid, group_id)) = validate_api_key(token, state).await {
-                if let Some(tool) = tool_name {
-                    state.tool_usage_batcher.mark_used(uid.clone(), tool);
-                }
-                // Notify call-log middleware (if present) of the resolved user_id.
-                // The middleware inserted CallLogContext into extensions before calling next;
-                // we fill in the user_id so it can record the call after the handler returns.
-                if let Some(ctx) = parts.extensions.get::<CallLogContext>() {
-                    if let Ok(mut guard) = ctx.0.lock() {
-                        *guard = Some(uid.clone());
+            else if let Some(principal) =
+                validate_api_key(token, state, parts.uri.path() == "/auth/whoami").await
+            {
+                authorize_api_key_route(&parts.method, parts.uri.path(), &principal.scopes)?;
+                let uid = principal.user_id.clone();
+                let group_id = principal.group_id.clone();
+                let memory_telemetry = principal
+                    .scopes
+                    .iter()
+                    .any(|scope| matches!(scope.as_str(), SCOPE_MEMORY_READ | SCOPE_MEMORY_WRITE));
+                if memory_telemetry {
+                    if let Some(tool) = tool_name {
+                        state.tool_usage_batcher.mark_used(uid.clone(), tool);
+                    }
+                    // Only admitted memory-capable requests may enqueue logs
+                    // whose persistence can provision a personal memory DB.
+                    if let Some(ctx) = parts.extensions.get::<CallLogContext>() {
+                        if let Ok(mut guard) = ctx.0.lock() {
+                            *guard = Some(uid.clone());
+                        }
                     }
                 }
                 let scope_id = group_id.clone().unwrap_or_else(|| uid.clone());
@@ -1006,6 +1119,9 @@ impl FromRequestParts<AppState> for AuthUser {
                     scope_id,
                     group_id,
                     is_master: false,
+                    key_id: Some(principal.key_id),
+                    key_prefix: Some(principal.key_prefix),
+                    scopes: principal.scopes,
                 });
             } else {
                 crate::metrics::registry().security.auth_failures.inc();
@@ -1052,6 +1168,9 @@ impl FromRequestParts<AppState> for AuthUser {
             group_id: None,
             user_id,
             is_master: true,
+            key_id: None,
+            key_prefix: None,
+            scopes: parse_scopes(DEFAULT_API_KEY_SCOPES),
         })
     }
 }
@@ -1062,7 +1181,11 @@ impl FromRequestParts<AppState> for AuthUser {
 /// Uses a dedicated auth connection pool so that auth validation is never
 /// blocked by slow business queries on the main pool.
 /// `last_used_at` is updated via batched writes (see [`LastUsedBatcher`]).
-async fn validate_api_key(token: &str, state: &AppState) -> Option<(String, Option<String>)> {
+async fn validate_api_key(
+    token: &str,
+    state: &AppState,
+    fresh: bool,
+) -> Option<CachedApiKeyPrincipal> {
     state.service.sql_store.as_ref()?;
     let key_hash = format!("{:x}", Sha256::digest(token.as_bytes()));
 
@@ -1077,10 +1200,15 @@ async fn validate_api_key(token: &str, state: &AppState) -> Option<(String, Opti
     // because (a) cache TTL is 5 min, and (b) remove_member / delete_group invalidate
     // the cache for revoked keys.  The DB-level check on cache miss is the
     // authoritative membership gate.
-    if let Some(principal) = state.api_key_cache.get(&key_hash) {
+    // Login/refresh must observe revocations made through any API replica.
+    // Bypass cache reads entirely: another in-flight request may repopulate
+    // an old grant between invalidation and lookup.
+    if fresh {
+        state.api_key_cache.invalidate(&key_hash);
+    } else if let Some(principal) = state.api_key_cache.get(&key_hash) {
         // Still enqueue last_used_at update (batched, no DB pressure)
         state.last_used_batcher.mark_used(key_hash);
-        return Some((principal.user_id, principal.group_id));
+        return Some(principal);
     }
 
     let Some(pool) = state.auth_pool.as_ref() else {
@@ -1089,7 +1217,7 @@ async fn validate_api_key(token: &str, state: &AppState) -> Option<(String, Opti
     };
 
     let row = sqlx::query(
-        "SELECT user_id, group_id FROM mem_api_keys \
+        "SELECT key_id, user_id, group_id, key_prefix, scopes, expires_at FROM mem_api_keys \
          WHERE key_hash = ? AND is_active = 1 \
          AND (expires_at IS NULL OR expires_at > NOW(6))",
     )
@@ -1101,6 +1229,14 @@ async fn validate_api_key(token: &str, state: &AppState) -> Option<(String, Opti
 
     let user_id: String = row.try_get("user_id").ok()?;
     let group_id: Option<String> = row.try_get("group_id").ok().flatten();
+    let principal = CachedApiKeyPrincipal {
+        key_id: row.try_get("key_id").ok()?,
+        user_id: user_id.clone(),
+        group_id: group_id.clone(),
+        key_prefix: row.try_get("key_prefix").ok()?,
+        scopes: parse_scopes(&row.try_get::<String, _>("scopes").ok()?),
+        expires_at: row.try_get("expires_at").ok()?,
+    };
 
     // Enforce real-time group membership: even if the key references a group,
     // the user must still be an active member in `mem_group_members` and the
@@ -1133,16 +1269,106 @@ async fn validate_api_key(token: &str, state: &AppState) -> Option<(String, Opti
     // Cache the result (TTL 5 min)
     state
         .api_key_cache
-        .insert(key_hash.clone(), user_id.clone(), group_id.clone());
+        .insert(key_hash.clone(), principal.clone());
 
     // Enqueue batched last_used_at update — zero DB pressure on hot path
     state.last_used_batcher.mark_used(key_hash);
 
-    Some((user_id, group_id))
+    Some(principal)
+}
+/// Unknown authenticated routes are master-only until explicitly classified.
+fn authorize_api_key_route(
+    method: &axum::http::Method,
+    path: &str,
+    scopes: &[String],
+) -> Result<(), (StatusCode, String)> {
+    let required = required_scope_for_request(method, path).ok_or((
+        StatusCode::FORBIDDEN,
+        "API key access is not enabled for this route".to_string(),
+    ))?;
+    if scopes.iter().any(|scope| scope == required) {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::FORBIDDEN,
+            format!("API key missing required scope: {required}"),
+        ))
+    }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classifies_memory_read_and_write_routes() {
+        assert_eq!(
+            required_scope_for_request(&axum::http::Method::POST, "/v1/memories/retrieve"),
+            Some(SCOPE_MEMORY_READ)
+        );
+        assert_eq!(
+            required_scope_for_request(&axum::http::Method::GET, "/v1/memories/abc"),
+            Some(SCOPE_MEMORY_READ)
+        );
+        assert_eq!(
+            required_scope_for_request(&axum::http::Method::POST, "/v1/memories"),
+            Some(SCOPE_MEMORY_WRITE)
+        );
+        assert_eq!(
+            required_scope_for_request(&axum::http::Method::DELETE, "/v1/snapshots/one"),
+            Some(SCOPE_MEMORY_WRITE)
+        );
+        assert_eq!(
+            required_scope_for_request(&axum::http::Method::GET, "/auth/whoami"),
+            Some(SCOPE_IDENTITY_READ)
+        );
+    }
+
+    #[test]
+    fn restricted_keys_cannot_administer_groups_or_use_unclassified_routes() {
+        use axum::http::Method;
+        for scopes in [
+            "identity:read",
+            "identity:read,memory:read",
+            "identity:read,memory:read,memory:write",
+        ] {
+            let scopes = parse_scopes(scopes);
+            for (method, path) in [
+                (Method::GET, "/v1/groups"),
+                (Method::POST, "/v1/groups"),
+                (Method::POST, "/v1/groups/group/members/another-user"),
+                (Method::DELETE, "/v1/groups/group"),
+                (Method::DELETE, "/v1/groups/group/members/another-user"),
+                (Method::GET, "/unclassified-sensitive-route"),
+                (Method::POST, "/admin/users"),
+            ] {
+                assert_eq!(
+                    authorize_api_key_route(&method, path, &scopes)
+                        .unwrap_err()
+                        .0,
+                    StatusCode::FORBIDDEN
+                );
+            }
+            assert!(authorize_api_key_route(&Method::GET, "/auth/whoami", &scopes).is_ok());
+        }
+        assert!(authorize_api_key_route(
+            &Method::POST,
+            "/v1/groups",
+            &parse_scopes(DEFAULT_API_KEY_SCOPES)
+        )
+        .is_ok());
+        assert!(authorize_api_key_route(
+            &Method::GET,
+            "/unclassified-sensitive-route",
+            &parse_scopes(DEFAULT_API_KEY_SCOPES)
+        )
+        .is_err());
+        assert!(authorize_api_key_route(
+            &Method::GET,
+            "/v1/health/analyze",
+            &parse_scopes("identity:read")
+        )
+        .is_err());
+    }
 
     #[test]
     fn test_tool_usage_mark_and_query() {
