@@ -137,6 +137,146 @@ fn pick_result_or_skip(result: Result<Value, MemoriaError>, test_name: &str) -> 
 // ── 1. Basic workflow: create → checkout → store → checkout main → merge ──────
 
 #[tokio::test]
+async fn test_legacy_snapshot_branch_and_rollback_after_subject_migration() {
+    let (svc, git, uid, ctx) = setup().await;
+    let store = ctx.user_store(&uid).await;
+    let pool = ctx.user_db_pool(&uid).await;
+    store_mem("historical memory before schema upgrade", &svc, &uid).await;
+    // Reconstruct the v0.4 memory schema before taking the historical snapshot.
+    sqlx::raw_sql("ALTER TABLE mem_memories DROP INDEX idx_scope_subject_active")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql("ALTER TABLE mem_memories DROP COLUMN subject_id")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let snapshot = bname("legacy");
+    gc(
+        "memory_snapshot",
+        json!({"name": snapshot}),
+        &git,
+        &svc,
+        &uid,
+    )
+    .await;
+    store.migrate_user().await.unwrap();
+    store_mem("current memory after schema upgrade", &svc, &uid).await;
+    let branch = bname("legacybranch");
+    let result = gc(
+        "memory_branch",
+        json!({"name": branch, "from_snapshot": snapshot}),
+        &git,
+        &svc,
+        &uid,
+    )
+    .await;
+    assert!(text(&result).contains("Created"), "{result}");
+    gc("memory_checkout", json!({"name": branch}), &git, &svc, &uid).await;
+    let memories = svc.list_active(&uid, 10).await.unwrap();
+    assert_eq!(memories.len(), 1);
+    assert_eq!(
+        memories[0].content,
+        "historical memory before schema upgrade"
+    );
+    assert_eq!(memories[0].subject_id, None);
+    memoria_mcp::tools::call(
+        "memory_store",
+        json!({"content":"branch write after migration", "subject_id":"restored-subject"}),
+        &svc,
+        &uid,
+    )
+    .await
+    .unwrap();
+    let memories = svc.list_active(&uid, 10).await.unwrap();
+    assert_eq!(memories.len(), 2);
+    assert_eq!(
+        memories
+            .iter()
+            .find(|m| m.content == "branch write after migration")
+            .unwrap()
+            .subject_id
+            .as_deref(),
+        Some("restored-subject")
+    );
+    gc("memory_checkout", json!({"name": "main"}), &git, &svc, &uid).await;
+    assert_eq!(svc.list_active(&uid, 10).await.unwrap().len(), 2);
+    gc(
+        "memory_rollback",
+        json!({"name": snapshot}),
+        &git,
+        &svc,
+        &uid,
+    )
+    .await;
+    let memories = svc.list_active(&uid, 10).await.unwrap();
+    assert_eq!(memories.len(), 1);
+    assert_eq!(
+        memories[0].content,
+        "historical memory before schema upgrade"
+    );
+    store_mem("main write after legacy rollback", &svc, &uid).await;
+    assert_eq!(svc.list_active(&uid, 10).await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn test_legacy_snapshot_branch_migration_failure_does_not_register_clone() {
+    let (svc, git, uid, ctx) = setup().await;
+    let store = ctx.user_store(&uid).await;
+    let pool = ctx.user_db_pool(&uid).await;
+    store_mem("keep current memory on migration failure", &svc, &uid).await;
+    sqlx::raw_sql("ALTER TABLE mem_memories DROP INDEX idx_scope_subject_active")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql("ALTER TABLE mem_memories DROP COLUMN subject_id")
+        .execute(&pool)
+        .await
+        .unwrap();
+    // A missing base column must be rejected independently of the best-effort
+    // subject index. The current schema remains valid throughout the clone.
+    sqlx::raw_sql(
+        "ALTER TABLE mem_memories CHANGE COLUMN memory_type historical_type VARCHAR(20) NOT NULL",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let snapshot = bname("incompatible");
+    gc(
+        "memory_snapshot",
+        json!({"name":snapshot}),
+        &git,
+        &svc,
+        &uid,
+    )
+    .await;
+    sqlx::raw_sql(
+        "ALTER TABLE mem_memories CHANGE COLUMN historical_type memory_type VARCHAR(20) NOT NULL",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    store.migrate_user().await.unwrap();
+    let result = memoria_mcp::git_tools::call(
+        "memory_branch",
+        json!({"name":"rejected", "from_snapshot":snapshot}),
+        &git,
+        &svc,
+        &uid,
+    )
+    .await;
+    let error = result.expect_err("incompatible clone must not be exposed");
+    assert!(
+        error.to_string().contains("required column 'memory_type'"),
+        "{error}"
+    );
+    assert!(store.list_branches(&uid).await.unwrap().is_empty());
+    let clones: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name LIKE 'br_%'").fetch_one(&pool).await.unwrap();
+    assert_eq!(clones, 0, "failed migration must clean up its clone");
+    assert_eq!(svc.list_active(&uid, 10).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn test_basic_branch_workflow() {
     let (svc, git, uid, _ctx) = setup().await;
     let branch = bname("basic");
@@ -175,6 +315,201 @@ async fn test_basic_branch_workflow() {
         &uid,
     )
     .await;
+}
+
+#[tokio::test]
+async fn test_unicode_branch_names_work_with_and_without_snapshot() {
+    let (svc, git, uid, ctx) = setup().await;
+    let store = ctx.user_store(&uid).await;
+    store_mem("main original", &svc, &uid).await;
+    gc(
+        "memory_snapshot",
+        json!({"name":"unicode_branch_source"}),
+        &git,
+        &svc,
+        &uid,
+    )
+    .await;
+    for (name, from_snapshot) in [("实验", false), ("测试", true)] {
+        let args = if from_snapshot {
+            json!({"name":name, "from_snapshot":"unicode_branch_source"})
+        } else {
+            json!({"name":name})
+        };
+        let result = gc("memory_branch", args, &git, &svc, &uid).await;
+        assert!(text(&result).contains("Created"), "{result}");
+        let branches = store.list_branches(&uid).await.unwrap();
+        let (_, physical, _) = branches
+            .iter()
+            .find(|(display, _, _)| display == name)
+            .unwrap();
+        assert!(physical.is_ascii(), "{physical}");
+        gc("memory_checkout", json!({"name":name}), &git, &svc, &uid).await;
+        assert_eq!(svc.list_active(&uid, 10).await.unwrap().len(), 1);
+        store_mem("branch write", &svc, &uid).await;
+        assert_eq!(svc.list_active(&uid, 10).await.unwrap().len(), 2);
+        gc("memory_checkout", json!({"name":"main"}), &git, &svc, &uid).await;
+        assert_eq!(svc.list_active(&uid, 10).await.unwrap().len(), 1);
+    }
+    let branches = store.list_branches(&uid).await.unwrap();
+    assert_eq!(branches.len(), 2);
+    assert_ne!(
+        branches[0].1, branches[1].1,
+        "equal sanitized suffixes must not collide"
+    );
+}
+
+#[tokio::test]
+async fn test_existing_unicode_physical_branch_migrates_and_remains_usable() {
+    let (svc, git, uid, ctx) = setup().await;
+    let store = ctx.user_store(&uid).await;
+    let pool = ctx.user_db_pool(&uid).await;
+    // Model a real native branch with a legacy Unicode physical name. A plain
+    // CREATE TABLE LIKE has no branch lineage and newer MO correctly rejects
+    // DATA BRANCH DELETE on it. Clone to ASCII first, then rename: older MO's
+    // native clone parser cannot create a Unicode destination directly.
+    // Execute native DDL separately: MO 3.0.11's branch parser inspects the
+    // original SQL text and cannot handle it inside a multi-statement request.
+    for statement in [
+        "DATA BRANCH CREATE TABLE br_1234abcd_legacy FROM mem_memories",
+        "ALTER TABLE br_1234abcd_legacy RENAME TO `br_1234abcd_实验`",
+        "ALTER TABLE `br_1234abcd_实验` DROP INDEX idx_scope_subject_active",
+        "ALTER TABLE `br_1234abcd_实验` DROP COLUMN subject_id",
+    ] {
+        sqlx::raw_sql(statement).execute(&pool).await.unwrap();
+    }
+    // Validate the historical-clone path, then the startup path for an already
+    // registered old table. Neither may reject Unicode physical identifiers.
+    store
+        .ensure_branch_subject_id("br_1234abcd_实验")
+        .await
+        .unwrap();
+    for statement in [
+        "ALTER TABLE `br_1234abcd_实验` DROP INDEX idx_scope_subject_active",
+        "ALTER TABLE `br_1234abcd_实验` DROP COLUMN subject_id",
+    ] {
+        sqlx::raw_sql(statement).execute(&pool).await.unwrap();
+    }
+    store
+        .register_branch(&uid, "已有实验", "br_1234abcd_实验")
+        .await
+        .unwrap();
+    store.migrate_user().await.unwrap();
+    gc(
+        "memory_checkout",
+        json!({"name":"已有实验"}),
+        &git,
+        &svc,
+        &uid,
+    )
+    .await;
+    store_mem("write after legacy Unicode migration", &svc, &uid).await;
+    assert_eq!(svc.list_active(&uid, 10).await.unwrap().len(), 1);
+    gc("memory_checkout", json!({"name":"main"}), &git, &svc, &uid).await;
+    gc(
+        "memory_merge",
+        json!({"source":"已有实验"}),
+        &git,
+        &svc,
+        &uid,
+    )
+    .await;
+    assert_eq!(svc.list_active(&uid, 10).await.unwrap().len(), 1);
+    gc(
+        "memory_branch_delete",
+        json!({"name":"已有实验"}),
+        &git,
+        &svc,
+        &uid,
+    )
+    .await;
+    assert!(store.list_branches(&uid).await.unwrap().is_empty());
+    let remaining: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = 'br_1234abcd_实验'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(remaining, 0, "native branch deletion must remove the table");
+}
+
+#[tokio::test]
+async fn test_historical_branch_rejects_all_missing_live_columns_before_registration() {
+    for column in [
+        "source_event_ids",
+        "observed_at",
+        "created_at",
+        "embedding",
+        "updated_at",
+        "extra_metadata",
+        "trust_tier",
+    ] {
+        let (svc, git, uid, ctx) = setup().await;
+        let store = ctx.user_store(&uid).await;
+        let pool = ctx.user_db_pool(&uid).await;
+        // Rename rather than remove data; schema is deliberately broken only
+        // while taking the snapshot, then restored before the user operation.
+        let definition = match column {
+            "source_event_ids" => "JSON NOT NULL",
+            "observed_at" | "created_at" => "DATETIME(6) NOT NULL",
+            "updated_at" => "DATETIME(6)",
+            "embedding" => "VECF32(8)",
+            "extra_metadata" => "JSON",
+            "trust_tier" => "VARCHAR(10) DEFAULT 'T1'",
+            _ => unreachable!(),
+        };
+        // Obtain the actual vector dimension from the test environment.
+        let mut vector_type = sqlx::QueryBuilder::<sqlx::MySql>::new("VECF32(");
+        vector_type.push(test_dim()).push(")");
+        let vector_definition = vector_type.into_sql();
+        let definition = if column == "embedding" {
+            &vector_definition
+        } else {
+            definition
+        };
+        let mut rename =
+            sqlx::QueryBuilder::<sqlx::MySql>::new("ALTER TABLE mem_memories CHANGE COLUMN ");
+        rename
+            .push(column)
+            .push(" historical_missing ")
+            .push(definition);
+        sqlx::raw_sql(&rename.into_sql())
+            .execute(&pool)
+            .await
+            .unwrap();
+        gc(
+            "memory_snapshot",
+            json!({"name":"missing_column"}),
+            &git,
+            &svc,
+            &uid,
+        )
+        .await;
+        let mut restore = sqlx::QueryBuilder::<sqlx::MySql>::new(
+            "ALTER TABLE mem_memories CHANGE COLUMN historical_missing ",
+        );
+        restore.push(column).push(" ").push(definition);
+        sqlx::raw_sql(&restore.into_sql())
+            .execute(&pool)
+            .await
+            .unwrap();
+        let result = memoria_mcp::git_tools::call(
+            "memory_branch",
+            json!({"name":"rejected", "from_snapshot":"missing_column"}),
+            &git,
+            &svc,
+            &uid,
+        )
+        .await;
+        let error = result.expect_err("must reject an incomplete clone before registration");
+        assert!(error.to_string().contains(column), "{column}: {error}");
+        assert!(store.list_branches(&uid).await.unwrap().is_empty());
+        let clones: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name LIKE 'br_%'")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(clones, 0, "{column}: rejected clone must be cleaned");
+        store_mem("main remains usable", &svc, &uid).await;
+        assert_eq!(svc.list_active(&uid, 10).await.unwrap().len(), 1);
+    }
 }
 
 #[tokio::test]

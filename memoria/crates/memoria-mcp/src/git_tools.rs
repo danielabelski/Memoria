@@ -33,7 +33,7 @@ fn git_err(e: impl std::fmt::Display) -> MemoriaError {
 }
 
 fn validate_identifier(name: &str) -> Result<&str, MemoriaError> {
-    if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+    if memoria_core::is_safe_sql_identifier(name) {
         Ok(name)
     } else {
         Err(MemoriaError::Internal(format!(
@@ -98,6 +98,23 @@ fn sanitize_name(name: &str) -> String {
         clean = format!("s_{clean}");
     }
     clean
+}
+
+fn sanitize_branch_table_suffix(name: &str) -> String {
+    // Keep the previous spelling for ASCII names; only physical branch suffixes
+    // change for Unicode names. The random prefix disambiguates equal suffixes.
+    let ascii: String = name
+        .chars()
+        .take(40)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    sanitize_name(&ascii)
 }
 
 fn sanitize_snapshot_scope(scope: &str) -> String {
@@ -1046,19 +1063,27 @@ pub async fn call(
                 return Ok(mcp_text(&format!("Branch '{branch_name}' already exists.")));
             }
 
-            let safe = sanitize_name(branch_name);
+            // Physical branch names are ASCII; the registry preserves the user's
+            // original display name. Do not change sanitize_name: snapshots use
+            // its historical Unicode mapping when resolving existing names.
+            let safe = sanitize_branch_table_suffix(branch_name);
             let table_name = format!("br_{}_{}", &Uuid::new_v4().simple().to_string()[..8], safe);
 
             if let Some(snap) = from_snapshot {
-                // Create branch from snapshot: restore snapshot to temp, then branch.
-                // Source is always mem_memories — new branch inherits its schema including
-                // subject_id, so no post-create column migration is needed.
+                // Snapshot clones inherit the historical schema, which may predate
+                // subject_id. Reconcile it before the branch becomes visible.
                 let internal = resolve_snapshot_for_user(svc, user_id, snap)
                     .await?
                     .ok_or_else(|| MemoriaError::NotFound(format!("Snapshot '{snap}'")))?;
                 git.create_branch_from_snapshot(&table_name, "mem_memories", &internal)
                     .await
                     .map_err(git_err)?;
+                if let Err(error) = sql.ensure_branch_subject_id(&table_name).await {
+                    if let Err(cleanup_error) = git.drop_branch(&table_name).await {
+                        tracing::warn!(%cleanup_error, table = %table_name, "failed to clean up incompatible snapshot branch");
+                    }
+                    return Err(error);
+                }
             } else {
                 // Source is always mem_memories (never another branch table).
                 // schema.subject_id is guaranteed present after migrate_user(), so MO's
@@ -1198,10 +1223,10 @@ pub async fn call(
                 "INSERT INTO {main_table} \
                     (memory_id, user_id, memory_type, content, embedding, session_id, \
                      source_event_ids, extra_metadata, is_active, superseded_by, \
-                     trust_tier, initial_confidence, observed_at, created_at, updated_at) \
+                     trust_tier, initial_confidence, observed_at, created_at, updated_at, author_id, subject_id) \
                   SELECT b.memory_id, b.user_id, b.memory_type, b.content, b.embedding, b.session_id, \
                       b.source_event_ids, b.extra_metadata, b.is_active, b.superseded_by, \
-                      b.trust_tier, b.initial_confidence, b.observed_at, b.created_at, b.updated_at \
+                      b.trust_tier, b.initial_confidence, b.observed_at, b.created_at, b.updated_at, b.author_id, b.subject_id \
                   FROM {branch_table} b \
                   WHERE b.user_id = ? AND b.is_active = 1 \
                     AND NOT EXISTS (SELECT 1 FROM {main_table} m WHERE m.memory_id = b.memory_id) \
@@ -1212,6 +1237,7 @@ pub async fn call(
                         WHERE m.user_id = ? AND m.is_active = 1 \
                           AND m.embedding IS NOT NULL AND vector_dims(m.embedding) > 0 \
                           AND m.memory_type = b.memory_type \
+                          AND m.subject_id <=> b.subject_id \
                           AND l2_distance(m.embedding, b.embedding) < {L2_CONFLICT} \
                       ) \
                    )"
@@ -1751,6 +1777,7 @@ async fn collect_replace_candidates(
            ON b.user_id = ? AND b.is_active = 1 \
            AND b.content IS NOT NULL \
            AND b.memory_type = m.memory_type \
+           AND b.subject_id <=> m.subject_id \
            AND b.embedding IS NOT NULL AND vector_dims(b.embedding) > 0 \
          WHERE m.user_id = ? AND m.is_active = 1 \
            AND m.embedding IS NOT NULL AND vector_dims(m.embedding) > 0 \
@@ -2511,6 +2538,21 @@ fn parse_apply_updates(args: &Value) -> Result<Vec<memoria_git::ApplyUpdatePair>
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn branch_suffix_is_ascii_without_changing_unicode_snapshot_names() {
+        for name in ["实验", "café", "分支 / 测试", "🚀"] {
+            let suffix = super::sanitize_branch_table_suffix(name);
+            assert!(suffix.is_ascii());
+            assert!(memoria_core::is_safe_sql_identifier(&suffix));
+        }
+        assert_eq!(
+            super::sanitize_branch_table_suffix("my_branch-1"),
+            super::sanitize_name("my_branch-1")
+        );
+        assert_eq!(super::sanitize_name("实验"), "实验");
+        assert!(super::snap_internal("test", "实验").ends_with("_实验"));
+    }
+
     use super::{
         expect_tool_args, is_pick_conflict_error_message, is_pick_parser_error_message,
         map_pick_conflict, normalize_keys, parse_apply_string_array, parse_apply_updates,

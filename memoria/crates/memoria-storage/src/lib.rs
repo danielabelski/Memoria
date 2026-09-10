@@ -1,8 +1,10 @@
+mod branch_capability;
 pub mod graph;
 pub mod migration;
 pub mod pool_config;
 pub mod router;
 pub mod store;
+pub mod table_schema;
 
 pub use graph::types::{GraphEdge, GraphNode, NodeType};
 pub use graph::{

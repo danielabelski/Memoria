@@ -865,6 +865,7 @@ fn mo_to_vec(s: &str) -> Result<Vec<f32>, MemoriaError> {
 #[derive(Clone)]
 pub struct SqlMemoryStore {
     pool: MySqlPool,
+    branch_alter_capability: Arc<crate::branch_capability::BranchAlterCapability>,
     embedding_dim: usize,
     instance_id: String,
     database_url: Option<String>,
@@ -960,6 +961,9 @@ impl SqlMemoryStore {
     pub fn new(pool: MySqlPool, embedding_dim: usize, instance_id: String) -> Self {
         Self {
             pool,
+            branch_alter_capability: Arc::new(
+                crate::branch_capability::BranchAlterCapability::default(),
+            ),
             embedding_dim,
             instance_id,
             database_url: None,
@@ -1050,10 +1054,14 @@ impl SqlMemoryStore {
     }
 
     pub fn set_db_name(&mut self, name: String) {
+        self.branch_alter_capability =
+            Arc::new(crate::branch_capability::BranchAlterCapability::default());
         self.db_name = Some(name);
     }
 
     pub fn set_database_url(&mut self, url: String) {
+        self.branch_alter_capability =
+            Arc::new(crate::branch_capability::BranchAlterCapability::default());
         self.database_url = Some(url);
     }
 
@@ -1063,8 +1071,15 @@ impl SqlMemoryStore {
         if table.contains('.') || table.contains('`') {
             return table.to_string();
         }
+        // Legacy Unicode physical names need identifier quoting on older MO
+        // parsers. Preserve the existing representation of ASCII table names.
+        let table = if table.is_ascii() {
+            std::borrow::Cow::Borrowed(table)
+        } else {
+            std::borrow::Cow::Owned(quote_ident(table))
+        };
         match &self.db_name {
-            None => table.to_string(),
+            None => table.into_owned(),
             Some(db) => format!("`{}`.{}", db.replace('`', "``"), table),
         }
     }
@@ -1512,6 +1527,11 @@ impl SqlMemoryStore {
     }
 
     async fn apply_user_compat_migrations(&self, pool: &MySqlPool) -> Result<(), MemoriaError> {
+        // This legacy migration may ALTER both the parent and its branches.
+        // Check before any such DDL, not after an older engine materializes them.
+        if self.has_registered_branches().await? {
+            self.ensure_native_branch_alter_capability().await?;
+        }
         let schema_name = self.current_schema_name().await?;
         let schema_name = schema_name.as_ref();
         let memories_stats_table = self.t("mem_memories_stats");
@@ -1753,122 +1773,151 @@ impl SqlMemoryStore {
         .execute(pool)
         .await;
 
-        // author_id column — tracks the real human author in group mode
-        // Guard with existence check so the migration is idempotent (safe to run
-        // on both fresh and already-migrated databases).
-        let has_author_id =
-            info_schema_column_exists(pool, schema_name, "mem_memories", "author_id").await;
-        if !has_author_id {
-            let add_col = sqlx::query(&format!(
-                "ALTER TABLE {memories_table} ADD COLUMN author_id VARCHAR(64) DEFAULT NULL"
-            ))
-            .execute(pool)
-            .await;
-            match &add_col {
-                Ok(_) => tracing::info!("migration: added author_id column to {memories_table}"),
-                Err(e) if is_duplicate_column(e) => tracing::info!(
-                    "migration: author_id column already exists in {memories_table}, skipping"
-                ),
-                Err(e) => {
-                    tracing::error!("migration: failed to add author_id to {memories_table}: {e}")
-                }
-            }
-        } else {
-            tracing::debug!(
-                "migration: author_id column already exists in {memories_table}, skipping"
-            );
-        }
-        // Ensure the index exists even when the column already existed before this migration.
-        // This covers partially-migrated databases where `author_id` is present but
-        // `idx_author` is missing.
-        let has_memories_author_idx =
-            info_schema_index_exists(pool, schema_name, "mem_memories", "idx_author").await;
-        if !has_memories_author_idx {
-            let add_idx = sqlx::query(&format!(
-                "ALTER TABLE {memories_table} ADD INDEX idx_author (author_id)"
-            ))
-            .execute(pool)
-            .await;
-            if let Err(e) = add_idx {
-                tracing::warn!(
-                    "migration: failed to add idx_author on {memories_table} (may already exist): {e}"
-                );
-            }
-        }
-
-        // Also add author_id to any existing branch tables (which are separate physical tables).
-        // Branch tables are created as copies of mem_memories and need the same schema.
-        let branch_table_names: Vec<String> = match sqlx::query_scalar(&format!(
-            "SELECT table_name FROM {branches_table} WHERE status = 'active' AND table_name != ''"
-        ))
-        .fetch_all(pool)
-        .await
-        {
-            Ok(names) => names,
-            Err(e) => {
-                tracing::warn!(
-                    "migration: failed to load branch table names from {branches_table}, \
-                     skipping author_id/idx_author migration for branch tables: {e}"
-                );
-                vec![]
-            }
-        };
-
-        // Branch tables are physically separate copies of mem_memories; they need
-        // the same author_id column/index. ALTER TABLE here can race with a concurrent
-        // `data branch merge` (MatrixOne 20631 "def changed"), so we use a retrying
-        // helper instead of plain sqlx::query().execute().
-        for bt_raw in &branch_table_names {
-            // bt_raw is the raw table name (e.g. br_abc123_my_branch) without DB prefix.
-            // Validate against a strict allowlist before interpolating into DDL.
-            if !bt_raw
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_')
-            {
-                tracing::warn!(
-                    "migration: skipping branch table with invalid identifier '{bt_raw}'"
-                );
-                continue;
-            }
-            let bt_full = self.t(bt_raw);
-            let has_col = info_schema_column_exists(pool, schema_name, bt_raw, "author_id").await;
-            if !has_col {
-                let r = exec_ddl_with_retry(
-                    pool,
-                    &format!("ALTER TABLE {bt_full} ADD COLUMN author_id VARCHAR(64) DEFAULT NULL"),
-                )
-                .await;
-                match r {
-                    Ok(_) => tracing::info!("migration: added author_id to branch table {bt_full}"),
-                    Err(e) => {
-                        // Propagate the error so that migrate_user() does NOT write the
-                        // schema version. The migration will be retried on the next startup
-                        // rather than being silently marked as complete.
-                        tracing::error!(
-                            "migration: failed to add author_id to branch table {bt_full}: {e}"
-                        );
-                        return Err(db_err(e));
-                    }
-                }
-            }
-            // Always ensure the index exists regardless of whether the column was just
-            // added or was already present (handles "column exists but index is missing"
-            // on older databases). The error is expected when the index already exists.
-            let has_idx = info_schema_index_exists(pool, schema_name, bt_raw, "idx_author").await;
-            if !has_idx {
-                let _ = exec_ddl_with_retry(
-                    pool,
-                    &format!("ALTER TABLE {bt_full} ADD INDEX idx_author (author_id)"),
-                )
-                .await;
-            }
-        }
+        self.ensure_author_id_column(pool, schema_name).await?;
 
         // subject_id migration is handled unconditionally by ensure_subject_id_column(),
         // which is called before the schema-version short-circuit in migrate_user().
         // Do NOT add subject_id DDL here — it would duplicate work and use an older,
         // less robust implementation (no exec_ddl_with_retry / is_mo_concurrent_ddl_race).
 
+        Ok(())
+    }
+
+    /// Idempotently repair `author_id` on the parent and registered branches.
+    ///
+    /// This must run before the schema-version short-circuit: an older migration
+    /// skipped Unicode branch names but still stored schema version 2.
+    async fn ensure_author_id_column(
+        &self,
+        pool: &MySqlPool,
+        schema_name: &str,
+    ) -> Result<(), MemoriaError> {
+        let memories_exists: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=? AND table_name='mem_memories'",
+        )
+        .bind(schema_name)
+        .fetch_one(pool)
+        .await
+        .map_err(db_err)?;
+        if memories_exists == 0 {
+            return Ok(());
+        }
+        let memories_table = self.t("mem_memories");
+        let branches_table = self.t("mem_branches");
+        // Very old/partial schemas are repaired by apply_user_compat_migrations
+        // after bootstrap. A version-2 registry has both of these columns.
+        let registry_columns: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM information_schema.columns WHERE table_schema=? AND table_name='mem_branches' AND column_name IN ('table_name','status')",
+        )
+        .bind(schema_name)
+        .fetch_one(pool)
+        .await
+        .map_err(db_err)?;
+        let registry_ready = registry_columns == 2;
+        let branch_table_names: Vec<String> = if registry_ready {
+            sqlx::query_scalar(&format!(
+                "SELECT table_name FROM {branches_table} WHERE status='active' AND table_name != ''"
+            ))
+            .fetch_all(pool)
+            .await
+            .map_err(db_err)?
+        } else {
+            Vec::new()
+        };
+        let has_registered_branches = !branch_table_names.is_empty();
+
+        if !info_schema_column_exists(pool, schema_name, "mem_memories", "author_id").await {
+            if has_registered_branches {
+                self.ensure_native_branch_alter_capability().await?;
+            }
+            let ddl = format!(
+                "ALTER TABLE {memories_table} ADD COLUMN author_id VARCHAR(64) DEFAULT NULL"
+            );
+            if let Err(error) = exec_ddl_with_retry(pool, &ddl).await {
+                if !is_duplicate_column(&error) && !is_mo_concurrent_ddl_race(&error) {
+                    return Err(db_err(error));
+                }
+                tracing::debug!(%error, "rechecking parent author_id after concurrent DDL");
+            }
+        }
+        if !info_schema_column_exists(pool, schema_name, "mem_memories", "author_id").await {
+            return Err(MemoriaError::Database(
+                "Parent author_id migration did not complete".into(),
+            ));
+        }
+
+        if !info_schema_index_exists(pool, schema_name, "mem_memories", "idx_author").await {
+            let may_alter = if has_registered_branches {
+                match self.ensure_native_branch_alter_capability().await {
+                    Ok(()) => true,
+                    Err(error) => {
+                        tracing::warn!(%error, "skipping optional parent author index: ALTER capability unverified");
+                        false
+                    }
+                }
+            } else {
+                true
+            };
+            if may_alter {
+                let ddl = format!("ALTER TABLE {memories_table} ADD INDEX idx_author (author_id)");
+                if let Err(error) = exec_ddl_with_retry(pool, &ddl).await {
+                    tracing::warn!(%error, "parent author index unavailable; continuing without it");
+                }
+            }
+        }
+        if branch_table_names.is_empty() {
+            return Ok(());
+        }
+
+        let current =
+            crate::table_schema::read_table_columns(pool, schema_name, "mem_memories").await?;
+        let position = current
+            .iter()
+            .position(|column| column.name.eq_ignore_ascii_case("author_id"))
+            .ok_or_else(|| MemoriaError::Database("Current table is missing author_id".into()))?;
+        for table in branch_table_names {
+            if !memoria_core::is_safe_sql_identifier(&table) {
+                tracing::warn!(%table, "skipping branch with invalid physical identifier");
+                continue;
+            }
+            if !info_schema_column_exists(pool, schema_name, &table, "author_id").await {
+                self.ensure_native_branch_alter_capability().await?;
+                let mut ddl = sqlx::QueryBuilder::<sqlx::MySql>::new("ALTER TABLE ");
+                ddl.push(self.t(&table))
+                    .push(" ADD COLUMN author_id VARCHAR(64) DEFAULT NULL");
+                if position == 0 {
+                    ddl.push(" FIRST");
+                } else {
+                    ddl.push(" AFTER `")
+                        .push(current[position - 1].name.replace('`', "``"))
+                        .push("`");
+                }
+                if let Err(error) = exec_ddl_with_retry(pool, &ddl.into_sql()).await {
+                    if !is_duplicate_column(&error) && !is_mo_concurrent_ddl_race(&error) {
+                        return Err(db_err(error));
+                    }
+                    tracing::debug!(%error, %table, "rechecking branch author_id after concurrent DDL");
+                }
+            }
+            if !info_schema_column_exists(pool, schema_name, &table, "author_id").await {
+                return Err(MemoriaError::Database(format!(
+                    "Branch author_id migration did not complete for '{table}'"
+                )));
+            }
+            if !info_schema_index_exists(pool, schema_name, &table, "idx_author").await {
+                if let Err(error) = self.ensure_native_branch_alter_capability().await {
+                    tracing::warn!(%error, %table, "skipping optional branch author index: ALTER capability unverified");
+                    continue;
+                }
+                let ddl = format!(
+                    "ALTER TABLE {} ADD INDEX idx_author (author_id)",
+                    self.t(&table)
+                );
+                if let Err(error) = exec_ddl_with_retry(pool, &ddl).await {
+                    tracing::warn!(%error, %table, "branch author index unavailable; continuing without it");
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1903,6 +1952,9 @@ impl SqlMemoryStore {
         let has_col =
             info_schema_column_exists(pool, schema_name, "mem_memories", "subject_id").await;
         if !has_col {
+            if self.has_registered_branches().await? {
+                self.ensure_native_branch_alter_capability().await?;
+            }
             match exec_ddl_with_retry(
                 pool,
                 &format!(
@@ -1936,28 +1988,41 @@ impl SqlMemoryStore {
         )
         .await;
         if !has_idx {
-            match exec_ddl_with_retry(
-                pool,
-                &format!(
-                    "ALTER TABLE {memories_table} ADD INDEX idx_scope_subject_active \
-                     (user_id, subject_id, is_active, memory_type)"
-                ),
-            )
-            .await
-            {
-                Ok(_) => tracing::info!(
-                    "migration: added idx_scope_subject_active on {memories_table}"
-                ),
-                Err(e) if is_duplicate_index(&e) => tracing::debug!(
-                    "migration: idx_scope_subject_active already exists on {memories_table}, skipping"
-                ),
-                Err(e) if is_mo_concurrent_ddl_race(&e) => tracing::warn!(
-                    "migration: concurrent DDL race for idx_scope_subject_active on \
-                     {memories_table}: {e}"
-                ),
-                Err(e) => tracing::warn!(
-                    "migration: failed to add idx_scope_subject_active on {memories_table}: {e}"
-                ),
+            let may_alter = if self.has_registered_branches().await? {
+                match self.ensure_native_branch_alter_capability().await {
+                    Ok(()) => true,
+                    Err(error) => {
+                        tracing::warn!(%error, "skipping optional parent index: ALTER capability unverified");
+                        false
+                    }
+                }
+            } else {
+                true
+            };
+            if may_alter {
+                match exec_ddl_with_retry(
+                    pool,
+                    &format!(
+                        "ALTER TABLE {memories_table} ADD INDEX idx_scope_subject_active \
+                         (user_id, subject_id, is_active, memory_type)"
+                    ),
+                )
+                .await
+                {
+                    Ok(_) => tracing::info!(
+                        "migration: added idx_scope_subject_active on {memories_table}"
+                    ),
+                    Err(e) if is_duplicate_index(&e) => tracing::debug!(
+                        "migration: idx_scope_subject_active already exists on {memories_table}, skipping"
+                    ),
+                    Err(e) if is_mo_concurrent_ddl_race(&e) => tracing::warn!(
+                        "migration: concurrent DDL race for idx_scope_subject_active on \
+                         {memories_table}: {e}"
+                    ),
+                    Err(e) => tracing::warn!(
+                        "migration: failed to add idx_scope_subject_active on {memories_table}: {e}"
+                    ),
+                }
             }
         }
 
@@ -1978,85 +2043,128 @@ impl SqlMemoryStore {
             }
         };
 
-        for bt_raw in &branch_table_names {
-            if !bt_raw
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_')
-            {
-                tracing::warn!(
-                    "migration: skipping branch table with invalid identifier '{bt_raw}'"
-                );
-                continue;
-            }
-            let bt_full = self.t(bt_raw);
-
-            let has_bt_col =
-                info_schema_column_exists(pool, schema_name, bt_raw, "subject_id").await;
-            if !has_bt_col {
-                match exec_ddl_with_retry(
-                    pool,
-                    &format!(
-                        "ALTER TABLE {bt_full} ADD COLUMN subject_id VARCHAR(128) DEFAULT NULL"
-                    ),
-                )
-                .await
-                {
-                    Ok(_) => {
-                        tracing::info!("migration: added subject_id to branch table {bt_full}")
-                    }
-                    Err(e) if is_duplicate_column(&e) => tracing::debug!(
-                        "migration: subject_id already exists in branch table {bt_full}, skipping"
-                    ),
-                    Err(e) if is_mo_concurrent_ddl_race(&e) => tracing::warn!(
-                        "migration: concurrent DDL race for subject_id on branch table {bt_full} \
-                         (column was added by a concurrent request): {e}"
-                    ),
-                    Err(e) => tracing::error!(
-                        // Non-fatal: startup continues, but any INSERT/SELECT that
-                        // references subject_id on this branch table will fail at
-                        // runtime with 'unknown column'.  Fix the DDL permission or
-                        // drop-and-recreate the branch, then restart.
-                        "migration: failed to add subject_id to branch table {bt_full}: {e}"
-                    ),
-                }
-            }
-
-            let has_bt_idx = info_schema_index_exists(
-                pool,
-                schema_name,
-                bt_raw,
-                "idx_scope_subject_active",
-            )
-            .await;
-            if !has_bt_idx {
-                match exec_ddl_with_retry(
-                    pool,
-                    &format!(
-                        "ALTER TABLE {bt_full} ADD INDEX idx_scope_subject_active \
-                         (user_id, subject_id, is_active, memory_type)"
-                    ),
-                )
-                .await
-                {
-                    Ok(_) => tracing::info!(
-                        "migration: added idx_scope_subject_active to branch table {bt_full}"
-                    ),
-                    Err(e) if is_duplicate_index(&e) => tracing::debug!(
-                        "migration: idx_scope_subject_active already exists on branch table \
-                         {bt_full}, skipping"
-                    ),
-                    Err(e) if is_mo_concurrent_ddl_race(&e) => tracing::warn!(
-                        "migration: concurrent DDL race for idx_scope_subject_active on \
-                         branch table {bt_full}: {e}"
-                    ),
-                    Err(e) => tracing::warn!(
-                        "migration: failed to add idx_scope_subject_active to branch table \
-                         {bt_full}: {e}"
-                    ),
-                }
+        for table in &branch_table_names {
+            // Existing branches remain best-effort at startup. New clones use
+            // the same migration below, but must pass it before registration.
+            if let Err(error) = self.migrate_branch_subject_id(table, schema_name).await {
+                tracing::error!(%error, %table, "branch subject_id migration failed");
             }
         }
 
+        Ok(())
+    }
+
+    /// A historical clone must have usable columns before it can be registered.
+    /// The subject index is a best-effort performance optimization.
+    pub async fn ensure_branch_subject_id(&self, table: &str) -> Result<(), MemoriaError> {
+        if !table.starts_with("br_") {
+            return Err(MemoriaError::Validation("Invalid branch table name".into()));
+        }
+        let schema = self.current_schema_name().await?;
+        self.migrate_branch_subject_id(table, schema.as_ref()).await
+    }
+
+    /// Check on disposable tables before ALTER may affect native branch lineage.
+    pub async fn ensure_native_branch_alter_capability(&self) -> Result<(), MemoriaError> {
+        let schema = self.current_schema_name().await?;
+        self.branch_alter_capability
+            .ensure(&self.pool, &schema)
+            .await
+    }
+
+    async fn has_registered_branches(&self) -> Result<bool, MemoriaError> {
+        let schema = self.current_schema_name().await?;
+        // Unlike best-effort metadata helpers, a safety gate must not turn a
+        // catalog read failure into "no branches" and allow an unchecked ALTER.
+        let exists: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=? AND table_name='mem_branches'",
+        ).bind(schema.as_ref()).fetch_one(&self.pool).await.map_err(db_err)?;
+        if exists == 0 {
+            return Ok(false);
+        }
+        let count: i64 = sqlx::query_scalar(&format!(
+            "SELECT COUNT(*) FROM {} WHERE status='active' AND table_name != ''",
+            self.t("mem_branches")
+        ))
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(count != 0)
+    }
+
+    async fn migrate_branch_subject_id(
+        &self,
+        table: &str,
+        schema: &str,
+    ) -> Result<(), MemoriaError> {
+        if !memoria_core::is_safe_sql_identifier(table) {
+            return Err(MemoriaError::Validation("Invalid branch table name".into()));
+        }
+        let current =
+            crate::table_schema::read_table_columns(&self.pool, schema, "mem_memories").await?;
+        if !info_schema_column_exists(&self.pool, schema, table, "subject_id").await {
+            self.ensure_native_branch_alter_capability().await?;
+            let position = current
+                .iter()
+                .position(|column| column.name.eq_ignore_ascii_case("subject_id"))
+                .ok_or_else(|| {
+                    MemoriaError::Database("Current table is missing subject_id".into())
+                })?;
+            let mut ddl = sqlx::QueryBuilder::<sqlx::MySql>::new("ALTER TABLE ");
+            ddl.push(self.t(table))
+                .push(" ADD COLUMN subject_id VARCHAR(128) DEFAULT NULL");
+            // Match the live ordinal, not merely the name: some MO versions
+            // silently misinterpret native diffs between differently ordered tables.
+            if position == 0 {
+                ddl.push(" FIRST");
+            } else {
+                ddl.push(" AFTER `")
+                    .push(current[position - 1].name.replace('`', "``"))
+                    .push("`");
+            }
+            if let Err(error) = exec_ddl_with_retry(&self.pool, &ddl.into_sql()).await {
+                if !is_duplicate_column(&error) && !is_mo_concurrent_ddl_race(&error) {
+                    return Err(db_err(error));
+                }
+                tracing::debug!(%error, %table, "rechecking branch column after concurrent DDL");
+            }
+        }
+        // Subject migration is the only schema change this path performs.
+        // Require ALL live column names afterwards, including nullable/defaulted
+        // columns: current INSERT/SELECT statements explicitly reference them.
+        let columns = crate::table_schema::read_table_columns(&self.pool, schema, table).await?;
+        let present: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
+        if !present
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case("subject_id"))
+        {
+            return Err(MemoriaError::Database(
+                "Branch subject_id migration did not complete".into(),
+            ));
+        }
+        if let Some(column) = crate::table_schema::missing_columns(&current, &present).first() {
+            return Err(MemoriaError::Database(format!(
+                "Branch schema is missing required column '{}'",
+                column.name
+            )));
+        }
+        crate::table_schema::validate_native_branch_schema(&current, &columns)?;
+        if !info_schema_index_exists(&self.pool, schema, table, "idx_scope_subject_active").await {
+            if let Err(error) = self.ensure_native_branch_alter_capability().await {
+                tracing::warn!(%error, %table, "skipping optional branch index: ALTER capability unverified");
+                return Ok(());
+            }
+            let mut ddl = sqlx::QueryBuilder::<sqlx::MySql>::new("ALTER TABLE ");
+            ddl.push(self.t(table)).push(
+                " ADD INDEX idx_scope_subject_active (user_id, subject_id, is_active, memory_type)",
+            );
+            if let Err(error) = exec_ddl_with_retry(&self.pool, &ddl.into_sql()).await {
+                // Missing columns have already failed above. Index creation
+                // errors, including MO concurrent-DDL races, must not discard a
+                // usable branch. A subsequent migration can retry the index.
+                tracing::warn!(%error, %table, "branch subject index unavailable; continuing without it");
+            }
+        }
         Ok(())
     }
 
@@ -2117,8 +2225,10 @@ impl SqlMemoryStore {
         if let Err(e) = self.ensure_snapshot_extra_column(pool, schema_name).await {
             tracing::warn!("migration: ensure_snapshot_extra_column failed (non-fatal): {e}");
         }
-        // Always run subject_id migration regardless of schema version, because it was added
-        // after CURRENT_USER_SCHEMA_VERSION was already set to 2 for live deployments.
+        // These repairs must run regardless of schema version. author_id was
+        // previously skipped on Unicode physical branch names even though the
+        // migration stored version 2; subject_id was added after version 2.
+        self.ensure_author_id_column(pool, schema_name).await?;
         self.ensure_subject_id_column(pool, schema_name).await?;
         // Short-circuit only when the schema version is current AND the main table
         // actually exists. If mem_memories is somehow missing on a non-fresh database
