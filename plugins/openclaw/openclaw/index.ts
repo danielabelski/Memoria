@@ -16,6 +16,7 @@ import {
   type MemoriaStatsResponse,
 } from "./client.js";
 import { formatMemoryList, formatRelevantMemoriesContext } from "./format.js";
+import { resolveMemorySearchScore } from "./score.js";
 
 type ToolResult = {
   content: Array<{ type: "text"; text: string }>;
@@ -356,19 +357,6 @@ function buildCapabilitiesPayload(config: MemoriaPluginConfig): Record<string, u
   };
 }
 
-function normalizeScore(confidence?: number | null): number {
-  if (typeof confidence !== "number" || !Number.isFinite(confidence)) {
-    return 0.5;
-  }
-  if (confidence < 0) {
-    return 0;
-  }
-  if (confidence > 1) {
-    return 1;
-  }
-  return confidence;
-}
-
 function sliceContent(content: string, from?: number, lines?: number): string {
   const allLines = content.split(/\r?\n/);
   const start = Math.max(0, (from ?? 1) - 1);
@@ -394,14 +382,17 @@ function resolveUserId(
 }
 
 function toMemorySearchPayload(memories: MemoriaMemoryRecord[]) {
-  return memories.map((memory) => ({
-    path: buildMemoryPath(memory.memory_id),
-    startLine: 1,
-    endLine: Math.max(1, memory.content.split(/\r?\n/).length),
-    score: normalizeScore(memory.confidence),
-    snippet: memory.content,
-    source: "memory",
-  }));
+  return memories.map((memory) => {
+    const score = resolveMemorySearchScore(memory);
+    return {
+      path: buildMemoryPath(memory.memory_id),
+      startLine: 1,
+      endLine: Math.max(1, memory.content.split(/\r?\n/).length),
+      ...(score === undefined ? {} : { score }),
+      snippet: memory.content,
+      source: "memory",
+    };
+  });
 }
 
 function supportedToolNames(): string[] {

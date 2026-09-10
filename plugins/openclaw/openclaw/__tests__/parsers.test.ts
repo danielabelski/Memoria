@@ -2,22 +2,13 @@
  * Group 4: Response Parsing
  * "Can the plugin understand what Memoria returns?"
  *
- * Tests the text parsers that bridge Memoria's output to typed data structures.
- * These parsers are used by both embedded (MCP binary) and api (HTTP) modes.
- *
- * Note: parsers are not exported from client.ts, so we test them indirectly
- * through MemoriaClient methods with a mocked transport.
- * For direct parser testing, we import the module and use the internal functions
- * via a re-export helper or test the formatted text round-trip.
+ * Embedded mode uses the MCP binary's text format, while HTTP mode preserves
+ * structured API fields in JSON text blocks.
  */
 import { describe, it, expect, afterEach } from "vitest";
+import { MemoriaClient } from "../client.js";
 import { MemoriaHttpTransport } from "../http-client.js";
 import { buildApiConfig, mockFetch } from "./helpers.js";
-
-// We test parsers indirectly: http-client produces formatted text that
-// matches the Rust MCP binary format, and client.ts parsers consume it.
-// Here we verify the http-client output IS parseable by checking the
-// text format matches the expected patterns.
 
 const originalFetch = globalThis.fetch;
 let fetchHelper: ReturnType<typeof mockFetch>;
@@ -36,37 +27,37 @@ describe("Group 4: Response Parsing (format round-trip)", () => {
 
   // ── Memory list parsing ──────────────────────────────────
 
-  describe("Memory list text format", () => {
-    it("4.1 single memory → [id] (type) content", async () => {
+  describe("Structured HTTP memory format", () => {
+    it("4.1 preserves a single memory record", async () => {
       const t = setup();
       fetchHelper.respondWith(200, {
         results: [{ memory_id: "abc-123", memory_type: "semantic", content: "Hello world" }],
       });
       const result = await t.callTool("memory_retrieve", { query: "q" }) as any;
-      const text = result.content[0].text;
-      expect(text).toMatch(/^\[abc-123\] \(semantic\) Hello world$/);
+      expect(JSON.parse(result.content[0].text)).toEqual([
+        { memory_id: "abc-123", memory_type: "semantic", content: "Hello world" },
+      ]);
     });
 
-    it("4.2 multiple memories → one per line", async () => {
+    it("4.2 preserves multiple memories and retrieval scores", async () => {
       const t = setup();
       fetchHelper.respondWith(200, {
         results: [
-          { memory_id: "m1", memory_type: "semantic", content: "First" },
-          { memory_id: "m2", memory_type: "profile", content: "Second" },
+          { memory_id: "m1", memory_type: "semantic", content: "First", retrieval_score: 3.1 },
+          { memory_id: "m2", memory_type: "profile", content: "Second", retrieval_score: 1.7 },
         ],
       });
       const result = await t.callTool("memory_search", { query: "q" }) as any;
-      const lines = result.content[0].text.split("\n");
-      expect(lines).toHaveLength(2);
-      expect(lines[0]).toMatch(/^\[m1\] \(semantic\) First$/);
-      expect(lines[1]).toMatch(/^\[m2\] \(profile\) Second$/);
+      const records = JSON.parse(result.content[0].text);
+      expect(records).toHaveLength(2);
+      expect(records.map((record: any) => record.retrieval_score)).toEqual([3.1, 1.7]);
     });
 
-    it("4.3 empty results → 'No relevant memories found.'", async () => {
+    it("4.3 empty results remain a structured empty list", async () => {
       const t = setup();
       fetchHelper.respondWith(200, { results: [] });
       const result = await t.callTool("memory_retrieve", { query: "q" }) as any;
-      expect(result.content[0].text).toBe("No relevant memories found.");
+      expect(result.content[0].text).toBe("[]");
     });
 
     it("4.4 array response shape (no results wrapper)", async () => {
@@ -75,7 +66,29 @@ describe("Group 4: Response Parsing (format round-trip)", () => {
         { memory_id: "m1", memory_type: "semantic", content: "Direct array" },
       ]);
       const result = await t.callTool("memory_retrieve", { query: "q" }) as any;
-      expect(result.content[0].text).toContain("[m1] (semantic) Direct array");
+      expect(JSON.parse(result.content[0].text)).toEqual([
+        { memory_id: "m1", memory_type: "semantic", content: "Direct array" },
+      ]);
+    });
+
+    it("4.4b client parses structured records without dropping retrieval_score", async () => {
+      setup();
+      fetchHelper.respondWith(200, {
+        results: [
+          {
+            memory_id: "m1",
+            memory_type: "semantic",
+            content: "Scored result",
+            retrieval_score: 2.75,
+          },
+        ],
+      });
+      const client = new MemoriaClient(buildApiConfig());
+      const records = await client.search({ userId: "test-user", query: "q", topK: 5 });
+      client.close();
+
+      expect(records).toHaveLength(1);
+      expect(records[0].retrieval_score).toBe(2.75);
     });
   });
 

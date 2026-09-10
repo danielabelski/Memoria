@@ -359,8 +359,8 @@ export class MemoriaHttpTransport {
   }
 
   // ── Formatting helpers ────────────────────────────────────────
-  // Produce text output matching the Rust MCP binary's format so that
-  // the existing parsers in client.ts (parseMemoryTextList, etc.) work.
+  // Preserve structured API memory fields such as retrieval_score. The client
+  // also understands the Rust MCP binary's legacy text format.
 
   private formatMemoryList(data: unknown): string {
     // The retrieve/search endpoints return either an array or { results: [...] }
@@ -376,19 +376,7 @@ export class MemoriaHttpTransport {
   }
 
   private formatMemoryItems(items: unknown[]): string {
-    if (items.length === 0) {
-      return "No relevant memories found.";
-    }
-    const lines: string[] = [];
-    for (const item of items) {
-      const rec = this.asRecord(item);
-      if (!rec) continue;
-      const id = rec.memory_id ?? "";
-      const type = rec.memory_type ?? "semantic";
-      const content = typeof rec.content === "string" ? rec.content : "";
-      lines.push(`[${id}] (${type}) ${content}`);
-    }
-    return lines.join("\n");
+    return JSON.stringify(items);
   }
 
   private formatSnapshotList(data: unknown): string {

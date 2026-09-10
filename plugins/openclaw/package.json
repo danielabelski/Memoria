@@ -23,7 +23,7 @@
   "files": [
     "README.md",
     "skills/",
-    "openclaw/",
+    "dist/",
     "openclaw.plugin.json"
   ],
   "publishConfig": {
@@ -33,8 +33,13 @@
     "node": ">=22"
   },
   "scripts": {
+    "build": "node scripts/build-plugin.mjs",
+    "prepack": "npm run build && npm run verify:package",
     "test": "vitest --run",
-    "test:watch": "vitest"
+    "test:pack": "npm run build && npm run verify:package && node scripts/verify-packed-files.mjs",
+    "test:watch": "vitest",
+    "verify:package": "node scripts/verify-package.mjs",
+    "version": "node scripts/sync-version.mjs"
   },
   "peerDependencies": {
     "openclaw": ">=2026.3.0"
@@ -46,12 +51,13 @@
   },
   "devDependencies": {
     "@types/node": "^25.5.0",
+    "esbuild": "^0.27.7",
     "typescript": "^5.9.3",
     "vitest": "^4.1.0"
   },
   "openclaw": {
     "extensions": [
-      "./openclaw/index.ts"
+      "./dist/openclaw/index.js"
     ]
   }
 }

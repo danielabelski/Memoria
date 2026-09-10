@@ -179,16 +179,16 @@ describe("Group 3: Cloud API Communication", () => {
     });
   });
 
-  // ── Response text formatting ─────────────────────────────
+  // ── Response formatting ──────────────────────────────────
 
-  describe("Response text formatting", () => {
+  describe("Response formatting", () => {
     it("3.34 memory_store → 'Stored memory <id>: <content>'", async () => {
       fetchMock.respondWith(200, { memory_id: "m1", content: "hello world" });
       const result = await transport.callTool("memory_store", { content: "hello world" }) as any;
       expect(result.content[0].text).toBe("Stored memory m1: hello world");
     });
 
-    it("3.35 memory_retrieve with results → '[id] (type) content' per line", async () => {
+    it("3.35 memory_retrieve preserves structured records", async () => {
       fetchMock.respondWith(200, {
         results: [
           { memory_id: "m1", memory_type: "semantic", content: "First" },
@@ -196,15 +196,16 @@ describe("Group 3: Cloud API Communication", () => {
         ],
       });
       const result = await transport.callTool("memory_retrieve", { query: "q" }) as any;
-      const text = result.content[0].text;
-      expect(text).toContain("[m1] (semantic) First");
-      expect(text).toContain("[m2] (profile) Second");
+      expect(JSON.parse(result.content[0].text)).toEqual([
+        { memory_id: "m1", memory_type: "semantic", content: "First" },
+        { memory_id: "m2", memory_type: "profile", content: "Second" },
+      ]);
     });
 
-    it("3.36 memory_retrieve empty → 'No relevant memories found.'", async () => {
+    it("3.36 memory_retrieve empty → structured empty list", async () => {
       fetchMock.respondWith(200, { results: [] });
       const result = await transport.callTool("memory_retrieve", { query: "q" }) as any;
-      expect(result.content[0].text).toBe("No relevant memories found.");
+      expect(result.content[0].text).toBe("[]");
     });
 
     it("3.38 memory_profile with profile → profile text", async () => {

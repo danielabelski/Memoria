@@ -12,6 +12,7 @@ export type MemoriaMemoryRecord = {
   memory_type?: string;
   trust_tier?: string | null;
   confidence?: number | null;
+  retrieval_score?: number | null;
   session_id?: string | null;
   is_active?: boolean;
   observed_at?: string | null;
@@ -100,6 +101,10 @@ function normalizeMemoryRecord(value: Partial<MemoriaMemoryRecord> & Record<stri
       typeof value.confidence === "number" && Number.isFinite(value.confidence)
         ? value.confidence
         : null,
+    retrieval_score:
+      typeof value.retrieval_score === "number" && Number.isFinite(value.retrieval_score)
+        ? value.retrieval_score
+        : null,
     session_id:
       typeof value.session_id === "string" || value.session_id === null
         ? (value.session_id as string | null)
@@ -157,6 +162,22 @@ function parseMemoryTextList(text: string): MemoriaMemoryRecord[] {
   const trimmed = text.trim();
   if (!trimmed || trimmed.startsWith("No relevant memories found.") || trimmed === "No memories found.") {
     return [];
+  }
+
+  const structured = tryParseJson(trimmed);
+  const structuredRecord = asRecord(structured);
+  const structuredItems = Array.isArray(structured)
+    ? structured
+    : Array.isArray(structuredRecord?.results)
+      ? structuredRecord.results
+      : Array.isArray(structuredRecord?.items)
+        ? structuredRecord.items
+        : null;
+  if (structuredItems) {
+    return structuredItems
+      .map((entry) => asRecord(entry))
+      .filter((entry): entry is Record<string, unknown> => Boolean(entry))
+      .map((entry) => normalizeMemoryRecord(entry));
   }
 
   const memories: MemoriaMemoryRecord[] = [];
