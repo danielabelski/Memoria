@@ -12,8 +12,8 @@ describe("memory search scores", () => {
     expect(resolveMemorySearchScore({ retrieval_score: null, confidence: -0.2 })).toBe(0);
   });
 
-  it("omits a fabricated score when the backend did not return one", () => {
-    expect(resolveMemorySearchScore({ retrieval_score: null, confidence: null })).toBeUndefined();
+  it("uses an explicit lowest score when the backend did not return one", () => {
+    expect(resolveMemorySearchScore({ retrieval_score: null, confidence: null })).toBe(0);
   });
 
   it("reports API retrieval scores through the memory_search tool", async () => {
@@ -50,7 +50,7 @@ describe("memory search scores", () => {
       const searchTool = toolFactory!({}).find((tool) => tool.name === "memory_search")!;
       const result = await searchTool.execute("call-1", { query: "relevance", topK: 2 });
       expect(result.details.results[0].score).toBe(3.066);
-      expect(result.details.results[1]).not.toHaveProperty("score");
+      expect(result.details.results[1].score).toBe(0);
     } finally {
       globalThis.fetch = originalFetch;
     }

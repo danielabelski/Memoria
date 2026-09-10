@@ -382,17 +382,14 @@ function resolveUserId(
 }
 
 function toMemorySearchPayload(memories: MemoriaMemoryRecord[]) {
-  return memories.map((memory) => {
-    const score = resolveMemorySearchScore(memory);
-    return {
-      path: buildMemoryPath(memory.memory_id),
-      startLine: 1,
-      endLine: Math.max(1, memory.content.split(/\r?\n/).length),
-      ...(score === undefined ? {} : { score }),
-      snippet: memory.content,
-      source: "memory",
-    };
-  });
+  return memories.map((memory) => ({
+    path: buildMemoryPath(memory.memory_id),
+    startLine: 1,
+    endLine: Math.max(1, memory.content.split(/\r?\n/).length),
+    score: resolveMemorySearchScore(memory),
+    snippet: memory.content,
+    source: "memory",
+  }));
 }
 
 function supportedToolNames(): string[] {
