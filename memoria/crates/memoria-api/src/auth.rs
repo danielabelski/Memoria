@@ -26,6 +26,9 @@ pub const SCOPE_MEMORY_READ: &str = "memory:read";
 pub const SCOPE_MEMORY_WRITE: &str = "memory:write";
 pub const SCOPE_KEYS_MANAGE: &str = "keys:manage";
 pub const DEFAULT_API_KEY_SCOPES: &str = "identity:read,memory:read,memory:write,keys:manage";
+const OWNER_SCOPED_MASTER_SCOPES: &[&str] =
+    &[SCOPE_IDENTITY_READ, SCOPE_MEMORY_READ, SCOPE_MEMORY_WRITE];
+const MAX_OWNER_SCOPED_USER_ID_LEN: usize = 64;
 
 pub fn parse_scopes(value: &str) -> Vec<String> {
     value
@@ -34,6 +37,48 @@ pub fn parse_scopes(value: &str) -> Vec<String> {
         .filter(|scope| !scope.is_empty())
         .map(str::to_string)
         .collect()
+}
+
+fn owner_scoped_master_scopes() -> Vec<String> {
+    OWNER_SCOPED_MASTER_SCOPES
+        .iter()
+        .map(|scope| (*scope).to_string())
+        .collect()
+}
+
+fn validate_owner_scoped_master_request(
+    token: &str,
+    master_key: &str,
+    headers: &axum::http::HeaderMap,
+) -> Result<String, (StatusCode, String)> {
+    let master_match = !master_key.is_empty()
+        && token.len() == master_key.len()
+        && token.as_bytes().ct_eq(master_key.as_bytes()).into();
+    if !master_match {
+        return Err((StatusCode::UNAUTHORIZED, "Invalid token".to_string()));
+    }
+
+    let mut owner_values = headers.get_all("X-User-Id").iter();
+    let owner = owner_values
+        .next()
+        .filter(|_| owner_values.next().is_none())
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| {
+            !value.is_empty()
+                && value.trim() == *value
+                && value.len() <= MAX_OWNER_SCOPED_USER_ID_LEN
+                && !value.starts_with("grp_")
+                && !value.chars().any(char::is_control)
+        })
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                "Owner-scoped master authentication requires exactly one valid X-User-Id"
+                    .to_string(),
+            )
+        })?;
+
+    Ok(owner.to_string())
 }
 
 /// Agent labels are recorded only after the request's scope admission. MCP
@@ -1075,12 +1120,57 @@ impl FromRequestParts<AppState> for AuthUser {
             request_tool_name(&parts.headers)
         };
 
-        let bearer = parts
+        let authorization = parts
             .headers
             .get("Authorization")
             .and_then(|v| v.to_str().ok())
-            .filter(|v| v.starts_with("Bearer "))
-            .map(|v| &v[7..]);
+            .unwrap_or_default();
+        let owner_scoped_master = authorization.strip_prefix("Memoria-Owner ");
+        let bearer = authorization.strip_prefix("Bearer ");
+
+        // A trusted proxy may authenticate with the deployment master secret
+        // while explicitly attenuating it to one owner.  This is a distinct
+        // scheme so older Memoria servers fail closed with 401 instead of
+        // silently treating the request as an unrestricted Bearer master key.
+        if let Some(token) = owner_scoped_master {
+            let user_id = match validate_owner_scoped_master_request(
+                token,
+                &state.master_key,
+                &parts.headers,
+            ) {
+                Ok(user_id) => user_id,
+                Err(rejection) => {
+                    if rejection.0 == StatusCode::UNAUTHORIZED {
+                        crate::metrics::registry().security.auth_failures.inc();
+                        warn!(
+                            scheme = "Memoria-Owner",
+                            path = %parts.uri.path(),
+                            "auth: invalid token"
+                        );
+                    }
+                    return Err(rejection);
+                }
+            };
+            let scopes = owner_scoped_master_scopes();
+            authorize_api_key_route(&parts.method, parts.uri.path(), &scopes)?;
+            if let Some(tool) = tool_name {
+                state.tool_usage_batcher.mark_used(user_id.clone(), tool);
+            }
+            if let Some(ctx) = parts.extensions.get::<CallLogContext>() {
+                if let Ok(mut guard) = ctx.0.lock() {
+                    *guard = Some(user_id.clone());
+                }
+            }
+            return Ok(AuthUser {
+                scope_id: user_id.clone(),
+                group_id: None,
+                user_id,
+                is_master: false,
+                key_id: None,
+                key_prefix: None,
+                scopes,
+            });
+        }
 
         if let Some(token) = bearer {
             // 1) Master key — full access, fall through to X-User-Id extraction
@@ -1368,6 +1458,100 @@ mod tests {
             &parse_scopes("identity:read")
         )
         .is_err());
+    }
+
+    fn owner_headers(values: &[&'static str]) -> axum::http::HeaderMap {
+        let mut headers = axum::http::HeaderMap::new();
+        for value in values {
+            headers.append("X-User-Id", axum::http::HeaderValue::from_static(value));
+        }
+        headers
+    }
+
+    #[test]
+    fn owner_scoped_master_rejects_invalid_secret() {
+        let rejection = validate_owner_scoped_master_request(
+            "attacker-secret",
+            "expected-master",
+            &owner_headers(&["alice"]),
+        )
+        .unwrap_err();
+        assert_eq!(rejection.0, StatusCode::UNAUTHORIZED);
+
+        let rejection =
+            validate_owner_scoped_master_request("", "", &owner_headers(&["alice"])).unwrap_err();
+        assert_eq!(rejection.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn owner_scoped_master_requires_exactly_one_owner_header() {
+        let rejection =
+            validate_owner_scoped_master_request("master", "master", &owner_headers(&[]))
+                .unwrap_err();
+        assert_eq!(rejection.0, StatusCode::BAD_REQUEST);
+
+        let rejection = validate_owner_scoped_master_request(
+            "master",
+            "master",
+            &owner_headers(&["victim", "authenticated-user"]),
+        )
+        .unwrap_err();
+        assert_eq!(rejection.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn owner_scoped_master_enforces_storage_identity_width() {
+        let max_owner = "a".repeat(MAX_OWNER_SCOPED_USER_ID_LEN);
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("X-User-Id", max_owner.parse().unwrap());
+        assert_eq!(
+            validate_owner_scoped_master_request("master", "master", &headers).unwrap(),
+            max_owner
+        );
+
+        let oversized_owner = "a".repeat(MAX_OWNER_SCOPED_USER_ID_LEN + 1);
+        headers.insert("X-User-Id", oversized_owner.parse().unwrap());
+        let rejection =
+            validate_owner_scoped_master_request("master", "master", &headers).unwrap_err();
+        assert_eq!(rejection.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn owner_scoped_master_rejects_reserved_group_namespace() {
+        let rejection = validate_owner_scoped_master_request(
+            "master",
+            "master",
+            &owner_headers(&["grp_existing_group"]),
+        )
+        .unwrap_err();
+        assert_eq!(rejection.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn owner_scoped_master_scopes_exclude_administration() {
+        use axum::http::Method;
+
+        let scopes = owner_scoped_master_scopes();
+        assert_eq!(
+            scopes,
+            OWNER_SCOPED_MASTER_SCOPES
+                .iter()
+                .map(|scope| (*scope).to_string())
+                .collect::<Vec<_>>()
+        );
+        assert!(!scopes.iter().any(|scope| scope == SCOPE_KEYS_MANAGE));
+        assert_eq!(
+            authorize_api_key_route(&Method::GET, "/admin/stats", &scopes)
+                .unwrap_err()
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            authorize_api_key_route(&Method::POST, "/auth/keys", &scopes)
+                .unwrap_err()
+                .0,
+            StatusCode::FORBIDDEN
+        );
     }
 
     #[test]
